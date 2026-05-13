@@ -4,7 +4,7 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from copy import deepcopy
 from datasets import load_dataset
@@ -14,8 +14,14 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
 
 class GSM8KDataset(Dataset):
+    """GSM8K 中文数据集封装。
+
+    约定每条样本返回:
+    - prompt: 问题文本
+    - answer: 标准答案（用于奖励函数）
+    """
     def __init__(self, data_path, tokenizer):
-        
+        """加载 HuggingFace datasets 格式的数据集。"""
         self.tokenizer = tokenizer
         data = load_dataset(data_path)
         self.data = data['train']
@@ -33,6 +39,7 @@ class GSM8KDataset(Dataset):
 
 @dataclass
 class Samples:
+    """单个 group（同一 prompt 的多次采样）中间结果容器。"""
     prompt_response_ids: torch.Tensor
     response_ids: torch.Tensor
     prompt: Any
@@ -44,7 +51,7 @@ class Samples:
 
 
 class GRPOArguments:
-    
+    """训练超参数配置（简化版，无 dataclass）。"""
     output_dir = './output'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     lr = 0.000001
@@ -58,10 +65,18 @@ class GRPOArguments:
     clip_eps_high = 0.28
     clip_eps_low = 0.2
     gradient_accumulation_steps = 2 # 梯度累加
-    num_iterations = 1 # 采样一次样本训练模型轮数
-    batch_size = 1
+    num_iterations = 2 # 采样一次样本训练模型轮数
+    batch_size = 2
 
 class GRPOTrainer:
+    """GRPO/DAPO 训练器。
+
+    训练主流程:
+    1) generate_samples: 对每个 prompt 采样多条 response（组内采样）
+    2) generate_experiences: 计算奖励、优势、old/ref log_probs
+    3) compute_loss: 计算 token-level PPO/GRPO/DAPO 损失
+    4) train_step/train: 梯度累积 + 多轮迭代更新
+    """
     def __init__(self,
         model = None,
         reward_funcs: Union[List[str], List[Callable]] = None,
@@ -130,12 +145,21 @@ class GRPOTrainer:
         
         # 模型更新的次数
         self.update_steps = 0 
+
     def get_tokenizer(self, tokenizer):
+        """统一 tokenizer 设置，训练时使用左填充。"""
         tokenizer.padding_side = "left"
         return tokenizer
     
     # 生成样本，以组为单位
     def generate_samples(self, inputs):
+        """按 prompt 生成 group 样本。
+
+        参数:
+            inputs: DataLoader 返回的 batch，至少包含 `prompt`。
+        返回:
+            List[Samples]，每个元素对应一个 prompt 的 group 数据。
+        """
         samples_list = []
         self.model.eval()
         prompts = [prompt for prompt in inputs['prompt']]
@@ -147,10 +171,16 @@ class GRPOTrainer:
         max_length = self.args.max_generate_length + self.args.max_prompt_length
         for prompt, answer in zip(prompts, answers):
             # 应用聊天模板，加入系统提示词
-            input_text = self.tokenizer.apply_chat_template([{"role": "system", 'content': SYSTEM_PROMPT}, {"role": "user", 'content': prompt}], add_generation_prompt=True, tokenize=False)
+            input_text = self.tokenizer.apply_chat_template([{"role": "system", 'content': SYSTEM_PROMPT}, {"role": "user", 'content': prompt}]
+                                                            , add_generation_prompt=True
+                                                            , tokenize=False)
             
-            # 生成一个group的输入数据
-            inputs = self.tokenizer([input_text] * self.args.num_generations, padding='max_length', max_length=self.args.max_prompt_length, truncation=True, return_tensors='pt')
+            # 生成一个 group 的输入（同一个 prompt 重复 num_generations 次）
+            inputs = self.tokenizer([input_text] * self.args.num_generations
+                                    , padding='max_length'
+                                    , max_length=self.args.max_prompt_length
+                                    , truncation=True
+                                    , return_tensors='pt')
             prompt_ids = inputs['input_ids']
             with torch.no_grad():
                 prompt_response_ids = self.model.generate(**inputs.to(self.args.device), 
@@ -159,13 +189,17 @@ class GRPOTrainer:
                                     top_p = 1,
                                     top_k = 50)
                 
+            # 对齐长度到 max_prompt_length + max_generate_length，便于后续 batch 化。
             if prompt_response_ids.size(1) >= max_length:
                 prompt_response_ids = prompt_response_ids[:, :max_length]
             else:
                 prompt_response_ids = torch.cat([prompt_response_ids, torch.full((prompt_response_ids.size(0), max_length - prompt_response_ids.size(1)), fill_value=self.tokenizer.pad_token_id, device=prompt_response_ids.device)], dim=1)
           
+            # attention_mask: prompt+response 全序列有效位
             attention_mask = (prompt_response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
+            # response_ids: 仅响应区间，用于奖励和 action 定位
             response_ids = prompt_response_ids[:, prompt_ids.size(1):]
+            # action_mask: 仅在 response 区域中，非 eos/pad 的 token 参与策略优化
             action_mask = (response_ids.ne(self.tokenizer.eos_token_id) & response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
         
 
@@ -186,23 +220,31 @@ class GRPOTrainer:
     
     # 生成经验(优势、token的概率分布)
     def generate_experiences(self, inputs):
+        """将采样结果转换为 PPO/GRPO 训练经验。
+
+        关键中间量:
+            rewards_per_func: [num_reward_funcs, num_generations]
+            rewards:          [num_generations]
+            advantages:       [num_generations] (句子粒度，组内标准化)
+            old/ref log_prob: [num_generations, num_actions]
+        """
         
         self.model.eval()
+        # [Samples(prompt_response_ids, response_ids, prompt, answer, attention_mask, action_mask, num_actions, response_length), ...]
         samples_list = self.generate_samples(inputs)
-        
         batch_prompt_response_ids = []
         batch_attention_mask = []
         batch_action_mask = []
         batch_advantages = []
         batch_old_action_log_probs = []
         batch_ref_action_log_probs = []
-        
+        # 遍历batch中每一个prompt，将其对应的n组输出也一起拼接
         for samples in samples_list:
             prompt_response_ids = samples.prompt_response_ids # shape: (num_generations, seq_len)
             response_ids = samples.response_ids # shape: (num_generations, seq_len)
             answer = samples.answer
             attention_mask = samples.attention_mask # shape: (num_generations, seq_len)
-            action_mask = samples.action_mask # shape: (num_generations, seq_len)
+            action_mask = samples.action_mask # shape: (num_generations, num_actions)
             num_actions = samples.num_actions
             prompt = samples.prompt
             
@@ -214,6 +256,7 @@ class GRPOTrainer:
                 # 将输出转换成文本
                 response_texts = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
                 prompt_texts = [prompt] * len(response_texts)
+                # 奖励模型常基于“完整对话（prompt+response）”评分。
                 prompt_response_texts = [prompt + response for prompt, response in zip(prompt_texts, response_texts)]
                 
                 for i, (reward_func, reward_tokenizer) in enumerate(
@@ -226,11 +269,13 @@ class GRPOTrainer:
                     
                     else:
                         answers = [answer] * len(prompt_texts)
+                        # 输出为list，每个元素为单个响应的奖励值
                         output_reward_func = reward_func(prompts=prompt_texts, responses=response_texts, answers=answers)
+                        # 奖励函数返回 None 时置为 NaN，便于后续定位异常样本/奖励函数。
                         output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                         rewards_per_func[i] = torch.tensor(output_reward_func, dtype=torch.float32, device=self.args.device)
                 
-                # rewards_per_func: [num_funcs, num_generations]
+                # rewards_per_func: [num_funcs, num_generations], 每一条都应该有一个单独的奖励值
                 if not self.args.reward_weights:
                     self.args.reward_weights = [1.0] * len(self.reward_funcs)
                 if len(self.args.reward_weights) != len(self.reward_funcs):
@@ -241,6 +286,7 @@ class GRPOTrainer:
                 rewards = rewards.sum(dim=0) # shape: [num_generations]
                 print(f'rewards: {rewards}')
                 
+                # 组内均值方差标准化（GRPO核心）：只比较同一 prompt 下多条采样结果。
                 mean_group_rewards = rewards.mean()
                 std_group_rewards = rewards.std()
                 
@@ -250,16 +296,17 @@ class GRPOTrainer:
                 nonzero_num = advantages.count_nonzero().item()
                 if nonzero_num == 0:
                     continue
-                
+                # 将有收益的数据加载保存，但是会不满足bacth data的size，需要后续拼接
                 batch_advantages.append(advantages)
                 
                 # 计算策略模型输出token的概率
+                # old_action_log_probs: 采样策略在动作区间 token 上的对数概率
                 old_action_log_probs = self.get_action_log_probs(self.model, prompt_response_ids, attention_mask, num_actions)
                 batch_old_action_log_probs.append(old_action_log_probs)
                 
                 # 是否使用参考模型
                 if self.ref_model:
-                    #计算参考模型输出token的概率
+                    # ref_action_log_probs: 用于 KL 正则项
                     ref_action_log_probs = self.get_action_log_probs(self.ref_model, prompt_response_ids, attention_mask, num_actions)
                     batch_ref_action_log_probs.append(ref_action_log_probs)
                     
@@ -279,16 +326,25 @@ class GRPOTrainer:
         }
     
     def compute_loss(self, model, inputs):
+        """计算 GRPO/DAPO 目标。
+
+        输入形状（cat 后）:
+            prompt_response_ids: [batch_size * num_generations, seq_len]
+            action_mask:         [batch_size * num_generations, num_actions]
+            advantages:          [batch_size * num_generations]
+        """
         
         prompt_response_ids = inputs['prompt_response_ids']
         attention_mask = inputs['attention_mask']
         action_mask = inputs['action_mask']
         num_actions = action_mask.size(1)
+        # 当前策略在动作 token 上的 log_prob
         action_log_probs = self.get_action_log_probs(model, prompt_response_ids, attention_mask, num_actions)
         
         if self.args.beta != 0.0:
             
             ref_action_log_probs = inputs['ref_action_log_probs']
+            # log_ratio > 0 表示参考模型概率更高；log_ratio < 0 表示当前模型概率更高。
             log_ratio = ref_action_log_probs - action_log_probs 
             log_ratio = log_ratio * action_mask
             
@@ -297,9 +353,11 @@ class GRPOTrainer:
         
         advantages = inputs['advantages']
         
+        # num_iterations == 1 时，old policy 退化为当前 policy（detach）以保持公式一致。
         old_action_log_probs = inputs['old_action_log_probs'] if self.args.num_iterations > 1 else action_log_probs.detach()
         coef_1 = torch.exp(action_log_probs - old_action_log_probs) # 重要性采样 shape: [batch_size * num_generations, num_actions]
         coef_2 = torch.clamp(coef_1, 1 - self.args.clip_eps_low, 1 + self.args.clip_eps_high)
+        # 句子级优势广播到 token 维：同一 response 的每个 token 共享同一 advantage。
         per_token_loss1 = coef_1 * advantages.unsqueeze(1) # 一个序列中每个token的优势是一样的
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2) # shape: [batch_size * num_generations, num_actions]
@@ -317,6 +375,7 @@ class GRPOTrainer:
         # loss = per_token_loss.sum(-1).sum(-1) / action_mask.sum(-1).sum(-1) # shape: [batch_size]
         # loss = loss.mean()
         
+        # 当前启用的聚合方式：先在组内所有 token 上求平均，再对 batch 求均值。
         per_token_loss = per_token_loss.view(-1, self.args.num_generations, num_actions) #  shape: [batch_size, num_generations, num_actions]
         action_mask = action_mask.view(-1, self.args.num_generations, num_actions)
         loss = per_token_loss.sum(-1).sum(-1) / action_mask.sum(-1).sum(-1) # shape: [batch_size]
@@ -326,6 +385,13 @@ class GRPOTrainer:
 
 
     def get_action_log_probs(self, model, input_ids, attention_mask, num_actions):
+        """提取动作区间 token 的 teacher-forcing log_probs。
+
+        步骤:
+        1) logits[:, :-1, :] 与 labels=input_ids[:, 1:] 对齐
+        2) gather 出真实 label 的对数概率
+        3) 仅保留最后 num_actions（对应 response 动作区间）
+        """
         
         # 计算策略模型输出token的概率
         output = model(input_ids, attention_mask=attention_mask)
@@ -338,6 +404,7 @@ class GRPOTrainer:
     
     
     def train_step(self, model, inputs, optimizer, step):
+        """单个微步训练（支持梯度累积）。"""
         model.train()
         # scaler = torch.amp.GradScaler()
         # with torch.amp.autocast(device_type='cuda'):
@@ -353,11 +420,19 @@ class GRPOTrainer:
             # scaler.step(optimizer)
             # scaler.update()
         
-            writer.add_scalar("grpo_loss", loss.item(), self.update_steps)
+            # writer.add_scalar("grpo_loss", loss.item(), self.update_steps)
             print(f"step: {self.update_steps}/{self.global_steps}  grpo_loss: {loss.item():.8f}")
         torch.cuda.empty_cache()
 
     def train(self):
+        """训练入口。
+
+        逻辑:
+        - 不断采样并写入 buffer（按 group 存）
+        - 凑够训练 batch 后拼接为 tensor
+        - 根据 gradient_accumulation_steps 触发优化器更新
+        - 每次更新可复用同一批经验做 num_iterations 轮优化
+        """
         self.global_steps = self.args.num_iterations * self.args.epoch * len(self.train_dataset) // (self.args.batch_size * self.args.gradient_accumulation_steps)
         for _ in range(self.args.epoch):
             
@@ -370,8 +445,30 @@ class GRPOTrainer:
                       'advantages':[]}
             idx = 0
             for batch in dataloader:
-
+                # {'prompt': ['足球队的财务主管必须为其球队的 16 名球员购买装备。每件装备包括一件 25 美元的球衣、一条 15.20 美元的短裤和一双 6.80 美元的袜子。队伍中所有玩家的所有装备要多少钱？', '詹姆斯在锻炼时受伤了。三天后疼痛就减轻了，但他知道伤势至少需要五倍的时间才能完全愈合。之后，他想再等三天再开始锻炼。如果他想等三周后再开始举重，那么他需要多长时间才能再次举重？']
+                # , 'answer': tensor([752,  39])}
                 inputs = self.generate_experiences(batch)
+                """
+                {'prompt_response_ids': [tensor([[151643, 151643, 151643,  ..., 151643, 151643, 151643],
+                [151643, 151643, 151643,  ..., 151643, 151643, 151643],
+                [151643, 151643, 151643,  ...,     17,     15, 100252],
+                [151643, 151643, 151643,  ...,     20,     17, 101237]])]
+                , 'attention_mask': [tensor([[0, 0, 0,  ..., 0, 0, 0],
+                [0, 0, 0,  ..., 0, 0, 0],
+                [0, 0, 0,  ..., 1, 1, 1],
+                [0, 0, 0,  ..., 1, 1, 1]])], 'action_mask': [tensor([[1, 1, 1,  ..., 0, 0, 0],
+                [1, 1, 1,  ..., 0, 0, 0],
+                [1, 1, 1,  ..., 1, 1, 1],
+                [1, 1, 1,  ..., 1, 1, 1]])], 'old_action_log_probs': [tensor([[-6.6509e-04, -1.2123e-04, -3.0386e-01,  ..., -1.5479e+01,
+                -1.5379e+01, -1.4846e+01],
+                [-6.6509e-04, -1.2123e-04, -3.0386e-01,  ..., -1.4115e+01,
+                -1.3853e+01, -1.4426e+01],
+                [-6.6509e-04, -1.2123e-04, -3.0386e-01,  ..., -1.1921e-07,
+                -2.3075e-03, -1.1264e-03],
+                [-6.6509e-04, -1.2123e-04, -3.0386e-01,  ..., -2.3842e-07,
+                -4.1723e-06, -2.3041e-04]])], 'ref_action_log_probs': None, 'advantages': [tensor([ 1.4142,  0.0000, -0.7071, -0.7071])]}
+                """
+                # buffer 中每个元素是“一个 prompt 对应的 group 张量”，后续再统一 cat。
                 buffer['prompt_response_ids']+=inputs['prompt_response_ids']
                 buffer['attention_mask']+=inputs['attention_mask']
                 buffer['action_mask'] += inputs['action_mask']
@@ -390,6 +487,7 @@ class GRPOTrainer:
                     continue
                 
                 if self.ref_model is not None:
+                    # 取前 batch_size 个 group，沿 group 维拼接为 [batch_size * num_generations, ...]
                     inputs = {k: v[:self.args.batch_size] for k, v in buffer.items()}
                     inputs = {k: torch.cat(v, dim=0) for k, v in inputs.items()}
                     buffer = {k: v[self.args.batch_size:] for k, v in buffer.items()}
@@ -404,6 +502,7 @@ class GRPOTrainer:
 
                 if (idx + 1) % self.args.gradient_accumulation_steps == 0:
                    
+                    # 同一批经验可重复训练 num_iterations 轮（on-policy 近似下的小步复用）。
                     for _ in range(self.args.num_iterations):
                         for step, inputs in enumerate(self.input_buffer):
                             self.train_step(self.model, inputs, self.optimizer, step)
@@ -416,7 +515,9 @@ class GRPOTrainer:
                 idx += 1
                    
                 del inputs
+
     def save_model(self):
+        """保存最终模型与 tokenizer。"""
         self.model.save_pretrained(self.args.output_dir)
         self.tokenizer.save_pretrained(self.args.output_dir)           
 
@@ -436,10 +537,10 @@ if __name__ == "__main__":
     
     args = GRPOArguments()
     
-    writer = SummaryWriter('./runs')
+    # writer = SummaryWriter('./runs')
     # 策略模型
-    tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/Qwen2.5-3B-Instruct')
-    model = AutoModelForCausalLM.from_pretrained('/home/user/Downloads/Qwen2.5-3B-Instruct')
+    tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3-0.6B')
+    model = AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-0.6B')
     # 奖励函数
     # reward_model = '/home/user/Downloads/reward-model-deberta-v3-large-v2'
     # reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
@@ -447,7 +548,7 @@ if __name__ == "__main__":
 
     
     
-    prompts_dataset = GSM8KDataset('/home/user/wyf/deepseek_learn/gsm8k_chinese', tokenizer)
+    prompts_dataset = GSM8KDataset('swulling/gsm8k_chinese', tokenizer)
   
     trainer = GRPOTrainer(model=model,
                           reward_funcs = [correctness_reward, digit_reward, hard_format_reward, mark_reward],
